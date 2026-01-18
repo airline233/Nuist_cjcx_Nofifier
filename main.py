@@ -8,6 +8,34 @@ import truststore
 from pathlib import Path
 truststore.inject_into_ssl()
 
+# URL 配置
+BASE_URL_NORMAL = "https://jwxt.nuist.edu.cn"
+BASE_URL_VPN = "https://client.vpn.nuist.edu.cn/https/webvpn0852a5f822ad5ca19fb52006c843ea2e7397e76d41c77f8a91f1345208e4e34b"
+VPN_COOKIES_FILE = Path(__file__).parent / "vpn_cookies.json"
+
+# 全局变量，运行时设置
+BASE_URL = BASE_URL_NORMAL
+USE_VPN = False
+
+
+def load_vpn_cookies():
+    """
+    从父级目录加载 vpn_cookies.json
+    :return: cookies 字典，失败时返回 None
+    """
+    if not VPN_COOKIES_FILE.exists():
+        print(f"[!] VPN cookies 文件不存在: {VPN_COOKIES_FILE}")
+        return None
+    try:
+        with open(VPN_COOKIES_FILE, 'r', encoding='utf-8') as f:
+            cookies = json.load(f)
+        print("[*] 已加载 VPN cookies")
+        return cookies
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"[!] 加载 VPN cookies 失败: {e}")
+        return None
+
+
 # 假设 NuistLogin.py 在同级目录下
 try:
     from NuistLogin import NuistLogin
@@ -52,19 +80,27 @@ def delete_cookies_cache():
         print(f"[!] 删除 Cookies 缓存失败: {e}")
 
 
-def check_cookies_valid(session, cookies, user=""):
+def check_cookies_valid(session, cookies, user="", vpn_cookies=None):
     """
     检查 cookies 是否仍然有效
     通过访问教务系统页面，检查是否会重定向到 authserver.nuist.edu.cn
     如果 authserver cookies 有效，会自动完成认证并更新 session cookies
     :param session: requests.Session 对象（会被更新 cookies）
     :param cookies: cookies 字典
+    :param vpn_cookies: VPN cookies 字典（VPN 模式必须）
     :return: True 如果有效（包括自动认证成功），False 如果失效
     """
     if not cookies:
         return False
     
-    test_url = "https://jwxt.nuist.edu.cn/jwapp/sys/emaphome/portal/index.do"
+    # VPN 模式下先加载 vpn_cookies
+    if USE_VPN:
+        if not vpn_cookies:
+            print("[!] VPN 模式下缺少 vpn_cookies")
+            return False
+        session.cookies.update(vpn_cookies)
+    
+    test_url = f"{BASE_URL}/jwapp/sys/emaphome/portal/index.do"
     
     try:
         session.cookies.update(cookies)
@@ -157,15 +193,15 @@ def fetch_gpa(session):
     :param session: 已登录的 requests.Session 对象
     :return: GPA 字符串，失败时返回 None
     """
-    gpa_url = 'https://jwxt.nuist.edu.cn/jwapp/sys/cjcx/modules/cjfx/cxxsgpa.do'
+    gpa_url = f'{BASE_URL}/jwapp/sys/cjcx/modules/cjfx/cxxsgpa.do'
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0',
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'X-Requested-With': 'XMLHttpRequest',
-        'Origin': 'https://jwxt.nuist.edu.cn',
-        'Referer': 'https://jwxt.nuist.edu.cn/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh',
+        'Origin': BASE_URL,
+        'Referer': f'{BASE_URL}/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh',
     }
     
     try:
@@ -198,8 +234,15 @@ def send_onebot_notification(user, qq_number, new_grades, gpa=None, webhook_url=
     :param webhook_url: OneBot HTTP API 地址
     :return: 是否发送成功
     """
+    # 将 args.multi 规范化为布尔值，避免字符串 'False' 被当作真值
+    multi_raw = getattr(args, "multi", False)
+    if isinstance(multi_raw, str):
+        multi_enabled = multi_raw.strip().lower() in ("1", "true", "yes", "y", "on")
+    else:
+        multi_enabled = bool(multi_raw)
+
     # 构建消息内容
-    if not args.multi:
+    if not multi_enabled:
         message_lines = [f"📢 成绩更新通知"]
     else:
         message_lines = [f"📢 {user} 成绩更新通知"]
@@ -237,31 +280,47 @@ def fetch_grades(user, pwd):
     登录并获取成绩原始数据
     优先使用缓存的 cookies，失效时重新登录
     从检查 cookies 开始到脚本结束使用同一个 session
+    VPN 模式下需要同时使用 vpn_cookies 和 jwxt cookies
     :return: (包含成绩信息的列表, session 对象)
     """
     session = requests.Session()
     need_login = True
+    vpn_cookies = None
     
-    # 1. 尝试使用缓存的 cookies
+    # VPN 模式：先加载 vpn_cookies
+    if USE_VPN:
+        vpn_cookies = load_vpn_cookies()
+        if not vpn_cookies:
+            print("[!] VPN 模式下未能加载 vpn_cookies，无法继续")
+            return [], None
+        session.cookies.update(vpn_cookies)
+        print(f"[*] VPN 模式: 已加载 WebVPN cookies")
+    
+    # 尝试使用缓存的 jwxt cookies
     cached_cookies = load_cookies()
     if cached_cookies:
         # 使用同一个 session 检查 cookies 有效性
         # 如果 authserver cookies 有效，会自动完成认证
-        if check_cookies_valid(session, cached_cookies, user):
+        if check_cookies_valid(session, cached_cookies, user, vpn_cookies):
             need_login = False
         else:
             # 缓存的 cookies 完全失效，需要重新登录
             delete_cookies_cache()
             # 重置 session 以便重新登录
             session = requests.Session()
+            # VPN 模式需要重新加载 vpn_cookies
+            if USE_VPN and vpn_cookies:
+                session.cookies.update(vpn_cookies)
     
     if need_login:
+        # service 始终使用原始 URL
         login_url = "https://jwxt.nuist.edu.cn/jwapp/sys/emaphome/portal/index.do"
-        print(f"[*] 正在登录用户: {user} ...")
+        print(f"[*] 正在登录用户: {user} ...{'(VPN模式)' if USE_VPN else ''}")
         
         try:
-            bot = NuistLogin(user, pwd, login_url, headless=True)
-            cookies = bot.login()  # 获取登录后的 cookies
+            bot = NuistLogin(user, pwd, login_url, headless=True,
+                             use_vpn=USE_VPN, vpn_cookies=vpn_cookies)
+            cookies = bot.login()  # 获取登录后的 cookies（VPN模式下包含vpn+jwxt）
         except Exception as e:
             print(f"[!] 登录过程发生错误: {e}")
             return [], None
@@ -279,7 +338,7 @@ def fetch_grades(user, pwd):
     print("[*] 正在获取成绩...")
 
     # 3. 准备请求数据
-    target_url = 'https://jwxt.nuist.edu.cn/jwapp/sys/cjcx/modules/cjcx/xscjcx.do'
+    target_url = f'{BASE_URL}/jwapp/sys/cjcx/modules/cjcx/xscjcx.do'
     
     # Headers
     headers = {
@@ -287,8 +346,8 @@ def fetch_grades(user, pwd):
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'X-Requested-With': 'XMLHttpRequest',
-        'Origin': 'https://jwxt.nuist.edu.cn',
-        'Referer': 'https://jwxt.nuist.edu.cn/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh',
+        'Origin': BASE_URL,
+        'Referer': f'{BASE_URL}/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh',
         'Sec-Fetch-Site': 'same-origin',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Dest': 'empty',
@@ -309,7 +368,7 @@ def fetch_grades(user, pwd):
     # 4. 发送请求
     try:
         # 使用 session 发送请求
-        session.get("https://jwxt.nuist.edu.cn/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh#/cjcx")  # 建立session
+        session.get(f"{BASE_URL}/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh#/cjcx")  # 建立session
         response = session.post(target_url, headers=headers, data=payload, timeout=10)
         response.raise_for_status()
         
@@ -350,16 +409,39 @@ def parse_args():
     parser.add_argument('-qq', '--qq', required=True, help='接收通知的QQ号')
     parser.add_argument('--webhook', default='http://127.0.0.1:3000/send_private_msg', 
                         help='OneBot HTTP API 地址 (默认: http://127.0.0.1:3000/send_private_msg)')
-    parser.add_argument('--multi', required=False, default=False, help='通知学号')
+    parser.add_argument('--multi', action='store_true', required=False, default=False, help='多用户模式：在通知中显示学号')
+    parser.add_argument('--vpn', action='store_true', required=False, default=False, 
+                        help='使用 WebVPN 访问教务系统')
+    parser.add_argument('--vpn-cookies', dest='vpn_cookies_path', default=None,
+                        help='VPN cookies 文件路径（相对或绝对路径，默认: 同级目录下的 vpn_cookies.json）')
     return parser.parse_args()
 
 if __name__ == "__main__":
     # 解析命令行参数
     args = parse_args()
     
-    # 成绩缓存文件和 Cookies 缓存文件路径
+    # 设置 VPN cookies 文件路径
+    if args.vpn_cookies_path:
+        # 支持相对路径和绝对路径
+        vpn_cookies_path = Path(args.vpn_cookies_path)
+        if not vpn_cookies_path.is_absolute():
+            vpn_cookies_path = Path.cwd() / vpn_cookies_path
+        VPN_COOKIES_FILE = vpn_cookies_path.resolve()
+    # 否则使用默认的同级目录
+    
+    # 根据 --vpn 参数设置 BASE_URL
+    if args.vpn:
+        USE_VPN = True
+        BASE_URL = BASE_URL_VPN
+        print(f"[*] 使用 WebVPN 模式")
+    else:
+        USE_VPN = False
+        BASE_URL = BASE_URL_NORMAL
+    
+    # 成绩缓存文件和 Cookies 缓存文件路径（VPN 模式使用独立缓存）
+    vpn_suffix = "_vpn" if USE_VPN else ""
     GRADES_CACHE_FILE = Path(__file__).parent / f"grades_cache_{args.user}.json"
-    COOKIES_CACHE_FILE = Path(__file__).parent / f"cookies_cache_{args.user}.pkl"
+    COOKIES_CACHE_FILE = Path(__file__).parent / f"cookies_cache_{args.user}{vpn_suffix}.pkl"
     
     # 执行获取成绩
     grade_list, session = fetch_grades(args.user, args.password)
