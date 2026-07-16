@@ -79,7 +79,8 @@ class NuistLogin:
         headless: bool = True,
         log_level: LogLevel = LogLevel.ERROR,
         use_vpn: bool = False,
-        vpn_cookies: dict = None
+        vpn_cookies: dict = None,
+        user_agent: str = None
     ):
         """
         初始化登录器
@@ -91,6 +92,7 @@ class NuistLogin:
         :param log_level: 日志级别
         :param use_vpn: 是否使用 VPN 模式
         :param vpn_cookies: VPN cookies 字典（可选，无则自动获取）
+        :param user_agent: 浏览器 User-Agent（可选）
         """
         self.username = username
         self.password = password
@@ -99,6 +101,8 @@ class NuistLogin:
         self.log_level = log_level
         self.use_vpn = use_vpn
         self.vpn_cookies = vpn_cookies or {}
+        self.user_agent = user_agent
+        self._cookie_format = "legacy"
         
         # 初始化 OCR
         self.ocr = ddddocr.DdddOcr(show_ad=False)
@@ -120,8 +124,18 @@ class NuistLogin:
     def _setup_browser_context(self, playwright) -> BrowserContext:
         """创建并配置浏览器上下文"""
         browser = playwright.chromium.launch(headless=self.headless)
-        context = browser.new_context()
+        context_options = {}
+        if self.user_agent:
+            context_options["user_agent"] = self.user_agent
+        context = browser.new_context(**context_options)
         return context
+
+    def _export_cookies(self, context: BrowserContext) -> dict | list[dict]:
+        """按调用方要求导出 Cookie，同时保留旧版返回格式。"""
+        cookies = context.cookies()
+        if self._cookie_format == "scoped":
+            return cookies
+        return {item['name']: item['value'] for item in cookies}
     
     def _load_vpn_cookies(self, context: BrowserContext):
         """将 VPN cookies 加载到浏览器上下文"""
@@ -369,7 +383,7 @@ class NuistLogin:
         
         raise CaptchaError(f"获取 VPN cookies 失败: {last_error}")
 
-    def _login_with_vpn(self, context: BrowserContext, page: Page) -> dict:
+    def _login_with_vpn(self, context: BrowserContext, page: Page) -> dict | list[dict]:
         """
         VPN 模式登录流程
         
@@ -404,7 +418,7 @@ class NuistLogin:
         vpn_login_url = f"{AUTHSERVER_VPN}/authserver/login?service={self.service}"
         return self._complete_vpn_login(context, page, vpn_login_url)
 
-    def _complete_vpn_login(self, context: BrowserContext, page: Page, login_url: str) -> dict:
+    def _complete_vpn_login(self, context: BrowserContext, page: Page, login_url: str) -> dict | list[dict]:
         """
         完成 VPN 登录流程（已有有效 VPN cookies）
         
@@ -436,11 +450,9 @@ class NuistLogin:
         else:
             raise CaptchaError(f"登录失败: {last_error}")
         
-        # 返回所有 cookies
-        all_cookies = context.cookies()
-        return {item['name']: item['value'] for item in all_cookies}
+        return self._export_cookies(context)
 
-    def _login_normal(self, context: BrowserContext, page: Page) -> dict:
+    def _login_normal(self, context: BrowserContext, page: Page) -> dict | list[dict]:
         """
         普通模式登录流程
         
@@ -459,8 +471,7 @@ class NuistLogin:
                 self._do_login_attempt(page, login_url)
                 self._log(LogLevel.INFO, "登录成功")
                 
-                all_cookies = context.cookies()
-                return {item['name']: item['value'] for item in all_cookies}
+                return self._export_cookies(context)
                 
             except CaptchaError as e:
                 last_error = e
@@ -469,15 +480,20 @@ class NuistLogin:
         
         raise CaptchaError(f"登录失败: {last_error}")
 
-    def login(self) -> dict:
+    def login(self, cookie_format: str = "legacy") -> dict | list[dict]:
         """
         执行登录流程
         
-        :return: 登录成功后的 cookies 字典
+        :param cookie_format: legacy 返回 {name: value}；scoped 返回完整 Cookie 列表
+        :return: 登录成功后的 cookies
         :raises CredentialError: 用户名或密码错误
         :raises CaptchaError: 验证码多次失败
         :raises LoginError: 其他登录错误
         """
+        if cookie_format not in ("legacy", "scoped"):
+            raise ValueError(f"不支持的 cookie_format: {cookie_format}")
+        self._cookie_format = cookie_format
+
         with sync_playwright() as playwright:
             context = self._setup_browser_context(playwright)
             page = context.new_page()
