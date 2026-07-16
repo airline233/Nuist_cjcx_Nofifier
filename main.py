@@ -5,22 +5,32 @@ import argparse
 import os
 import pickle
 import truststore
+from http.cookiejar import Cookie
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 truststore.inject_into_ssl()
 
 # URL 配置
 BASE_URL_NORMAL = "https://jwxt.nuist.edu.cn"
 BASE_URL_VPN = "https://client.vpn.nuist.edu.cn/https/webvpn0852a5f822ad5ca19fb52006c843ea2e7397e76d41c77f8a91f1345208e4e34b"
 VPN_COOKIES_FILE = Path(__file__).parent / "vpn_cookies.json"
+VPN_DOMAIN = "client.vpn.nuist.edu.cn"
+COMMON_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+MAX_AUTH_REDIRECTS = 10
 
 # 全局变量，运行时设置
 BASE_URL = BASE_URL_NORMAL
 USE_VPN = False
 
 
+class AuthenticationExpired(Exception):
+    """业务请求已被重定向到认证流程。"""
+
+
 def load_vpn_cookies():
     """
-    从父级目录加载 vpn_cookies.json
+    从配置路径加载 vpn_cookies.json
     :return: cookies 字典，失败时返回 None
     """
     if not VPN_COOKIES_FILE.exists():
@@ -36,15 +46,106 @@ def load_vpn_cookies():
         return None
 
 
-# 假设 NuistLogin.py 在同级目录下
+def save_vpn_cookies(cookies):
+    """只保存 WebVPN 网关 Cookie，保持原有 {name: value} 格式。"""
+    if not cookies:
+        return False
+    temp_file = VPN_COOKIES_FILE.with_suffix(f"{VPN_COOKIES_FILE.suffix}.tmp")
+    try:
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, VPN_COOKIES_FILE)
+        print("[*] VPN cookies 已更新")
+        return True
+    except (IOError, OSError) as e:
+        print(f"[!] 保存 VPN cookies 失败: {e}")
+        try:
+            temp_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 try:
+    os.sys.path.append(str(Path(__file__).parent.parent))  # 确保当前目录在 sys.path 中
     from NuistLogin import NuistLogin
 except ImportError:
     print("错误: 未找到 NuistLogin.py，请确保文件在同一目录下。")
     exit(1)
 
+
+def create_session():
+    """创建使用统一客户端标识的请求会话。"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': COMMON_USER_AGENT,
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    })
+    return session
+
+
+def install_vpn_gateway_cookies(session, cookies):
+    """将 vpn_cookies.json 中的 Cookie 限定在 WebVPN 网关根路径。"""
+    for name, value in (cookies or {}).items():
+        session.cookies.set(
+            name,
+            value,
+            domain=VPN_DOMAIN,
+            path='/',
+            secure=True,
+        )
+
+
+def playwright_cookies_to_jar(cookie_records):
+    """将 Playwright Cookie 列表转换为保留作用域的 RequestsCookieJar。"""
+    if not isinstance(cookie_records, list):
+        raise TypeError("scoped Cookie 返回值必须是列表")
+
+    jar = requests.cookies.RequestsCookieJar()
+    for item in cookie_records:
+        domain = item.get('domain', '')
+        path = item.get('path') or '/'
+        if not item.get('name') or 'value' not in item or not domain:
+            raise ValueError("scoped Cookie 缺少 name、value 或 domain")
+        raw_expires = item.get('expires')
+        expires = int(raw_expires) if raw_expires and raw_expires > 0 else None
+        domain_initial_dot = domain.startswith('.')
+        rest = {}
+        if item.get('httpOnly'):
+            rest['HttpOnly'] = None
+        if item.get('sameSite'):
+            rest['SameSite'] = item['sameSite']
+
+        jar.set_cookie(Cookie(
+            version=0,
+            name=item['name'],
+            value=item['value'],
+            port=None,
+            port_specified=False,
+            domain=domain,
+            domain_specified=domain_initial_dot,
+            domain_initial_dot=domain_initial_dot,
+            path=path,
+            path_specified=True,
+            secure=bool(item.get('secure')),
+            expires=expires,
+            discard=expires is None,
+            comment=None,
+            comment_url=None,
+            rest=rest,
+            rfc2109=False,
+        ))
+    return jar
+
+
 def save_cookies(cookies):
-    """保存 cookies 到文件（支持 cookiejar 或 dict）"""
+    """保存带完整 domain/path 作用域的 CookieJar。"""
+    if not isinstance(cookies, requests.cookies.RequestsCookieJar):
+        print("[!] 拒绝保存非 CookieJar 格式的 Cookies")
+        return False
+    if any(not cookie.domain or not cookie.path for cookie in cookies):
+        print("[!] 拒绝保存缺少 domain/path 作用域的 Cookies")
+        return False
     try:
         with open(COOKIES_CACHE_FILE, 'wb') as f:
             # 直接保存 cookiejar 对象，避免同名 cookie 冲突
@@ -63,9 +164,17 @@ def load_cookies():
     try:
         with open(COOKIES_CACHE_FILE, 'rb') as f:
             cookies = pickle.load(f)
+        if not isinstance(cookies, requests.cookies.RequestsCookieJar):
+            print("[*] Cookie 缓存格式过旧，将重新登录。")
+            delete_cookies_cache()
+            return None
+        if any(not cookie.domain or not cookie.path for cookie in cookies):
+            print("[*] Cookie 缓存缺少域名或路径作用域，将重新登录。")
+            delete_cookies_cache()
+            return None
         print("[*] 已从缓存加载 Cookies。")
         return cookies
-    except (IOError, pickle.PickleError, EOFError) as e:
+    except (IOError, pickle.PickleError, EOFError, AttributeError, TypeError, ValueError) as e:
         print(f"[!] 加载 Cookies 失败: {e}")
         return None
 
@@ -80,55 +189,116 @@ def delete_cookies_cache():
         print(f"[!] 删除 Cookies 缓存失败: {e}")
 
 
-def check_cookies_valid(session, cookies, user="", vpn_cookies=None):
+def sanitize_url(url):
+    """移除可能包含 CAS ticket 的查询参数，仅用于日志。"""
+    parsed = urlsplit(url)
+    path = parsed.path or '/'
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def request_origin(url):
+    parsed = urlsplit(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def allowed_auth_hosts():
+    hosts = {urlsplit(BASE_URL).hostname}
+    if not USE_VPN:
+        hosts.add(urlsplit("https://authserver.nuist.edu.cn").hostname)
+    return hosts
+
+
+def is_expected_service_url(url):
+    parsed = urlsplit(url)
+    base = urlsplit(BASE_URL)
+    service_prefix = f"{base.path.rstrip('/')}/jwapp/"
+    return parsed.hostname == base.hostname and parsed.path.startswith(service_prefix)
+
+
+def is_login_response(response):
+    url = response.url.lower()
+    if '/authserver/login' in url or '/enlink/sso/login' in url:
+        return True
+    body = response.text
+    return 'id="pwdFromId"' in body or "id='pwdFromId'" in body
+
+
+def format_redirect_chain(chain):
+    return ' -> '.join(f"{status} {url}" for status, url in chain)
+
+
+def get_with_controlled_redirects(session, url, headers=None, timeout=10):
+    """在限定域名和跳数内跟随认证重定向，并返回脱敏链路。"""
+    current_url = url
+    visited_redirects = set()
+    chain = []
+    allowed_hosts = allowed_auth_hosts()
+
+    for redirect_count in range(MAX_AUTH_REDIRECTS + 1):
+        if urlsplit(current_url).hostname not in allowed_hosts:
+            return None, chain, f"重定向到了非预期域名: {urlsplit(current_url).hostname}"
+
+        response = session.get(
+            current_url,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        chain.append((response.status_code, sanitize_url(response.url)))
+
+        if response.status_code not in REDIRECT_STATUS_CODES:
+            return response, chain, None
+
+        location = response.headers.get('Location')
+        if not location:
+            return None, chain, "重定向响应缺少 Location"
+        if redirect_count >= MAX_AUTH_REDIRECTS:
+            return None, chain, f"认证重定向超过 {MAX_AUTH_REDIRECTS} 次"
+        next_url = urljoin(response.url, location)
+        redirect_edge = (current_url, next_url)
+        if redirect_edge in visited_redirects:
+            return None, chain, "检测到重复重定向路径"
+        visited_redirects.add(redirect_edge)
+        current_url = next_url
+
+    return None, chain, f"认证重定向超过 {MAX_AUTH_REDIRECTS} 次"
+
+
+def check_cookies_valid(session, cookies, user=""):
     """
     检查 cookies 是否仍然有效
     通过访问教务系统页面，检查是否会重定向到 authserver.nuist.edu.cn
     如果 authserver cookies 有效，会自动完成认证并更新 session cookies
     :param session: requests.Session 对象（会被更新 cookies）
     :param cookies: cookies 字典
-    :param vpn_cookies: VPN cookies 字典（VPN 模式必须）
-    :return: True 如果有效（包括自动认证成功），False 如果失效
+    :return: True 如果有效，False 如果失效，None 如果因网络错误无法判断
     """
     if not cookies:
         return False
-    
-    # VPN 模式下先加载 vpn_cookies
-    if USE_VPN:
-        if not vpn_cookies:
-            print("[!] VPN 模式下缺少 vpn_cookies")
-            return False
-        session.cookies.update(vpn_cookies)
     
     test_url = f"{BASE_URL}/jwapp/sys/emaphome/portal/index.do"
     
     try:
         session.cookies.update(cookies)
-
-        # 允许重定向检查是否有效（authserver cookies 有效时会自动认证并跳回）
-        response = session.get(test_url, timeout=10, allow_redirects=True)
-        
-        # 检查是否发生了重定向（history 非空表示有跳转）
-        if response.history:
-            # print(f"[*] 检测到 {len(response.history)} 次重定向")
-
-            if 'authserver.nuist.edu.cn' in response.url or 'login' in response.url or response.status_code != 200:
-                print("[*] Cookies 已失效，需要重新登录。")
-                return False
-            else:
-                save_cookies(session.cookies)
-        
-        # 检查响应内容中是否包含登录页面特征
-        if '统一身份认证' in response.text or 'authserver' in response.text:
+        response, chain, redirect_error = get_with_controlled_redirects(session, test_url)
+        if redirect_error:
+            print(f"[!] Cookie 检查失败: {redirect_error}")
+            if chain:
+                print(f"[!] 重定向链: {format_redirect_chain(chain)}")
+            return False
+        if response.status_code != 200 or not is_expected_service_url(response.url):
+            print(f"[*] Cookies 已失效，最终响应: {response.status_code} {sanitize_url(response.url)}")
+            return False
+        if is_login_response(response):
             print("[*] Cookies 已失效，需要重新登录。")
             return False
         
         print(f"[*] {user} Cookies 有效")
         return True
-        
+
     except requests.exceptions.RequestException as e:
         print(f"[!] 检查 Cookies 有效性时发生错误: {e}")
-        return False
+        return None
 
 def parse_grades_data(json_data):
     """
@@ -196,17 +366,28 @@ def fetch_gpa(session):
     gpa_url = f'{BASE_URL}/jwapp/sys/cjcx/modules/cjfx/cxxsgpa.do'
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0',
+        'User-Agent': COMMON_USER_AGENT,
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'X-Requested-With': 'XMLHttpRequest',
-        'Origin': BASE_URL,
+        'Origin': request_origin(BASE_URL),
         'Referer': f'{BASE_URL}/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh',
     }
     
     try:
-        response = session.post(gpa_url, headers=headers, timeout=10)
+        response = session.post(
+            gpa_url,
+            headers=headers,
+            timeout=10,
+            allow_redirects=False,
+        )
+        if response.status_code in REDIRECT_STATUS_CODES or response.status_code in (401, 403):
+            raise AuthenticationExpired(
+                f"GPA 请求需要重新认证: {response.status_code} {sanitize_url(response.url)}"
+            )
         response.raise_for_status()
+        if is_login_response(response):
+            raise AuthenticationExpired("GPA 请求返回了登录页面")
         json_data = response.json()
         
         if json_data.get("code") == "0" or json_data.get("code") == 0:
@@ -217,11 +398,11 @@ def fetch_gpa(session):
                 return gpa
         print("[!] 获取 GPA 失败: 数据格式异常")
         return None
-    except requests.exceptions.RequestException as e:
-        print(f"[!] 获取 GPA 时发生错误: {e}")
-        return None
     except json.JSONDecodeError:
         print("[!] GPA 返回内容不是有效的 JSON")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"[!] 获取 GPA 时发生错误: {e}")
         return None
 
 def send_onebot_notification(user, qq_number, new_grades, gpa=None, webhook_url="http://127.0.0.1:3000/send_private_msg"):
@@ -243,7 +424,11 @@ def send_onebot_notification(user, qq_number, new_grades, gpa=None, webhook_url=
 
     # 构建消息内容
     if not multi_enabled:
-        message_lines = [f"📢 成绩更新通知"]
+        if len(new_grades) == 1:
+            grade = new_grades[0]
+            message_lines = [f"📢 {grade['课程名称']} 成绩更新通知"]
+        else:
+            message_lines = [f"📢 成绩更新通知"]
     else:
         message_lines = [f"📢 {user} 成绩更新通知"]
     for grade in new_grades:
@@ -265,14 +450,17 @@ def send_onebot_notification(user, qq_number, new_grades, gpa=None, webhook_url=
     
     try:
         response = requests.post(webhook_url, json=payload, timeout=10)
-        if response.status_code == 200:
-            print(f"[*] 通知已发送到 QQ: {qq_number}")
-            return True
-        else:
-            print(f"[!] 发送通知失败: HTTP {response.status_code}")
+        if response.status_code != 200:
+            print(f"[!] 发送通知失败: HTTP {response.status_code}\n请求body: {payload}\n响应body: {response.text}")
             return False
+        resp_data = response.json()
+        if resp_data.get("status") != "ok":
+            print(f"[!] 发送通知失败\n请求body: {payload}\n响应body: {resp_data}")
+            return False
+        print(f"[*] 通知已发送到 QQ: {qq_number}")
+        return True
     except requests.exceptions.RequestException as e:
-        print(f"[!] 发送通知时发生错误: {e}")
+        print(f"[!] 发送通知时发生错误: {e}\n请求body: {payload}")
         return False
 
 def fetch_grades(user, pwd):
@@ -283,7 +471,7 @@ def fetch_grades(user, pwd):
     VPN 模式下需要同时使用 vpn_cookies 和 jwxt cookies
     :return: (包含成绩信息的列表, session 对象)
     """
-    session = requests.Session()
+    session = create_session()
     need_login = True
     vpn_cookies = None
     
@@ -293,24 +481,25 @@ def fetch_grades(user, pwd):
         if not vpn_cookies:
             print("[!] VPN 模式下未能加载 vpn_cookies，无法继续")
             return [], None
-        session.cookies.update(vpn_cookies)
-        print(f"[*] VPN 模式: 已加载 WebVPN cookies")
+        install_vpn_gateway_cookies(session, vpn_cookies)
+        print("[*] VPN 模式: 已加载 WebVPN cookies")
     
     # 尝试使用缓存的 jwxt cookies
     cached_cookies = load_cookies()
     if cached_cookies:
         # 使用同一个 session 检查 cookies 有效性
         # 如果 authserver cookies 有效，会自动完成认证
-        if check_cookies_valid(session, cached_cookies, user, vpn_cookies):
+        cookies_valid = check_cookies_valid(session, cached_cookies, user)
+        if cookies_valid is True:
             need_login = False
-        else:
+        elif cookies_valid is False:
             # 缓存的 cookies 完全失效，需要重新登录
             delete_cookies_cache()
             # 重置 session 以便重新登录
-            session = requests.Session()
-            # VPN 模式需要重新加载 vpn_cookies
-            if USE_VPN and vpn_cookies:
-                session.cookies.update(vpn_cookies)
+            session = create_session()
+        else:
+            # 网络错误无法判断缓存是否失效，保留缓存供下次使用
+            return [], None
     
     if need_login:
         # service 始终使用原始 URL
@@ -319,8 +508,12 @@ def fetch_grades(user, pwd):
         
         try:
             bot = NuistLogin(user, pwd, login_url, headless=True,
-                             use_vpn=USE_VPN, vpn_cookies=vpn_cookies)
-            cookies = bot.login()  # 获取登录后的 cookies（VPN模式下包含vpn+jwxt）
+                             use_vpn=USE_VPN, vpn_cookies=vpn_cookies,
+                             user_agent=COMMON_USER_AGENT)
+            cookie_records = bot.login(cookie_format="scoped")
+            cookies = playwright_cookies_to_jar(cookie_records)
+            if USE_VPN and bot.vpn_cookies and bot.vpn_cookies != vpn_cookies:
+                save_vpn_cookies(bot.vpn_cookies)
         except Exception as e:
             print(f"[!] 登录过程发生错误: {e}")
             return [], None
@@ -330,9 +523,8 @@ def fetch_grades(user, pwd):
             return [], None
 
         print("[*] 登录成功！")
-        # 保存新的 cookies
-        save_cookies(cookies)
-        # 更新 session cookies
+        # 登录前的旧 Session 不再复用，避免失效 Cookie 混入新会话。
+        session = create_session()
         session.cookies.update(cookies)
     
     print("[*] 正在获取成绩...")
@@ -342,11 +534,11 @@ def fetch_grades(user, pwd):
     
     # Headers
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0',
+        'User-Agent': COMMON_USER_AGENT,
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'X-Requested-With': 'XMLHttpRequest',
-        'Origin': BASE_URL,
+        'Origin': request_origin(BASE_URL),
         'Referer': f'{BASE_URL}/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh',
         'Sec-Fetch-Site': 'same-origin',
         'Sec-Fetch-Mode': 'cors',
@@ -367,14 +559,43 @@ def fetch_grades(user, pwd):
 
     # 4. 发送请求
     try:
-        # 使用 session 发送请求
-        session.get(f"{BASE_URL}/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh#/cjcx")  # 建立session
-        response = session.post(target_url, headers=headers, data=payload, timeout=10)
+        index_url = f"{BASE_URL}/jwapp/sys/cjcx/*default/index.do?EMAP_LANG=zh"
+        index_response, chain, redirect_error = get_with_controlled_redirects(
+            session,
+            index_url,
+            timeout=10,
+        )
+        if redirect_error:
+            print(f"[!] 成绩页面认证失败: {redirect_error}")
+            if chain:
+                print(f"[!] 重定向链: {format_redirect_chain(chain)}")
+            delete_cookies_cache()
+            return [], None
+        if index_response.status_code != 200 or not is_expected_service_url(index_response.url):
+            print(
+                f"[!] 成绩页面认证失败: {index_response.status_code} "
+                f"{sanitize_url(index_response.url)}"
+            )
+            delete_cookies_cache()
+            return [], None
+
+        response = session.post(
+            target_url,
+            headers=headers,
+            data=payload,
+            timeout=10,
+            allow_redirects=False,
+        )
+        if response.status_code in REDIRECT_STATUS_CODES or response.status_code in (401, 403):
+            print(
+                f"[!] 成绩请求需要重新认证: {response.status_code} "
+                f"{sanitize_url(response.url)}"
+            )
+            delete_cookies_cache()
+            return [], None
         response.raise_for_status()
-        
-        # 检查是否被重定向到登录页面（cookies 可能在请求过程中失效）
-        if 'authserver.nuist.edu.cn' in response.url or response.status_code != 200:
-            print("[!] 请求过程中 Cookies 失效，请重新运行。")
+        if is_login_response(response):
+            print("[!] 成绩请求返回了登录页面，需要重新认证。")
             delete_cookies_cache()
             return [], None
         
@@ -391,14 +612,13 @@ def fetch_grades(user, pwd):
         # 解析数据
         return parse_grades_data(json_data), session
 
-    except requests.exceptions.RequestException as e:
-        print(f"[!] 网络请求错误: {e}")
-        delete_cookies_cache()
-        return [], None
     except json.JSONDecodeError:
         print("[!] 返回内容不是有效的 JSON")
         delete_cookies_cache()
         print(response.text[:500])  # 调试用，只打印前500字符
+        return [], None
+    except requests.exceptions.RequestException as e:
+        print(f"[!] 网络请求错误: {e}")
         return [], None
 
 def parse_args():
@@ -443,39 +663,54 @@ if __name__ == "__main__":
     GRADES_CACHE_FILE = Path(__file__).parent / f"grades_cache_{args.user}.json"
     COOKIES_CACHE_FILE = Path(__file__).parent / f"cookies_cache_{args.user}{vpn_suffix}.pkl"
     
-    # 执行获取成绩
-    grade_list, session = fetch_grades(args.user, args.password)
-    
-    if not grade_list:
-        print("[*] 未获取到成绩或列表为空。")
-        exit(0)
-    
-    # 加载缓存的成绩
-    cached_grades = load_cached_grades()
-    
-    # 查找新增的成绩
-    new_grades = find_new_grades(grade_list, cached_grades)
-    
-    if new_grades:
-        # 有新成绩，获取最新 GPA
-        gpa = fetch_gpa(session) if session else None
-        
-        # 输出并发送通知
-        print(f"\n[*] 发现 {len(new_grades)} 门新成绩:\n")
-        print("-" * 60)
-        print(f"{'课程名称':<20} | {'成绩':<5} | {'学分':<5} | {'学期'}")
-        print("-" * 60)
-        for course in new_grades:
-            print(f"{course['课程名称']:<20} | {course['成绩']:<5} | {course['学分']:<5} | {course['学期']}")
-        
-        # 发送 OneBot 通知
-        if send_onebot_notification(args.user, args.qq, new_grades, gpa, args.webhook):
-            # 只有通知发送成功才保存缓存
-            save_grades_cache(grade_list)
-            print("[*] 成绩已记录到缓存。")
+    # 执行获取成绩，并在所有业务请求结束后统一保存 session 中的 cookies
+    session = None
+    should_save_cookies = False
+    try:
+        grade_list, session = fetch_grades(args.user, args.password)
+        should_save_cookies = session is not None
+
+        if not grade_list:
+            print("[*] 未获取到成绩或列表为空。")
+            exit(0)
+
+        # 加载缓存的成绩
+        cached_grades = load_cached_grades()
+
+        # 查找新增的成绩
+        new_grades = find_new_grades(grade_list, cached_grades)
+
+        if new_grades:
+            # 有新成绩，获取最新 GPA
+            gpa = fetch_gpa(session) if session else None
+
+            # 输出并发送通知
+            print(f"\n[*] 发现 {len(new_grades)} 门新成绩:\n")
+            print("-" * 60)
+            print(f"{'课程名称':<20} | {'成绩':<5} | {'学分':<5} | {'学期'}")
+            print("-" * 60)
+            for course in new_grades:
+                print(f"{course['课程名称']:<20} | {course['成绩']:<5} | {course['学分']:<5} | {course['学期']}")
+
+            # 发送 OneBot 通知
+            if send_onebot_notification(args.user, args.qq, new_grades, gpa, args.webhook):
+                # 只有通知发送成功才保存缓存
+                save_grades_cache(grade_list)
+                print("[*] 成绩已记录到缓存。")
+            else:
+                print("[!] 通知发送失败，成绩未记录到缓存。")
         else:
-            print("[!] 通知发送失败，成绩未记录到缓存。")
-    else:
-        # 没有新成绩，也更新缓存（保持数据同步）
-        save_grades_cache(grade_list)
-        print("[*] 没有新成绩。")
+            # 没有新成绩，也更新缓存（保持数据同步）
+            save_grades_cache(grade_list)
+            print("[*] 没有新成绩。")
+    except AuthenticationExpired as e:
+        should_save_cookies = False
+        print(f"[!] {e}")
+        delete_cookies_cache()
+    except requests.exceptions.TooManyRedirects as e:
+        should_save_cookies = False
+        print(f"[!] 请求重定向次数超过限制，Cookies 已失效: {e}")
+        delete_cookies_cache()
+    finally:
+        if should_save_cookies:
+            save_cookies(session.cookies)
