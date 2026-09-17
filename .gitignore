@@ -37,6 +37,7 @@ env/
 grades_cache_*.json
 cookies_cache_*.pkl
 nuist_cookies.json
+passkey.local.json
 
 # Logs
 *.log
