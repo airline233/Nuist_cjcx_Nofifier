@@ -5,7 +5,6 @@ import argparse
 import os
 import pickle
 import truststore
-from http.cookiejar import Cookie
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 truststore.inject_into_ssl()
@@ -96,48 +95,6 @@ def install_vpn_gateway_cookies(session, cookies):
         )
 
 
-def playwright_cookies_to_jar(cookie_records):
-    """将 Playwright Cookie 列表转换为保留作用域的 RequestsCookieJar。"""
-    if not isinstance(cookie_records, list):
-        raise TypeError("scoped Cookie 返回值必须是列表")
-
-    jar = requests.cookies.RequestsCookieJar()
-    for item in cookie_records:
-        domain = item.get('domain', '')
-        path = item.get('path') or '/'
-        if not item.get('name') or 'value' not in item or not domain:
-            raise ValueError("scoped Cookie 缺少 name、value 或 domain")
-        raw_expires = item.get('expires')
-        expires = int(raw_expires) if raw_expires and raw_expires > 0 else None
-        domain_initial_dot = domain.startswith('.')
-        rest = {}
-        if item.get('httpOnly'):
-            rest['HttpOnly'] = None
-        if item.get('sameSite'):
-            rest['SameSite'] = item['sameSite']
-
-        jar.set_cookie(Cookie(
-            version=0,
-            name=item['name'],
-            value=item['value'],
-            port=None,
-            port_specified=False,
-            domain=domain,
-            domain_specified=domain_initial_dot,
-            domain_initial_dot=domain_initial_dot,
-            path=path,
-            path_specified=True,
-            secure=bool(item.get('secure')),
-            expires=expires,
-            discard=expires is None,
-            comment=None,
-            comment_url=None,
-            rest=rest,
-            rfc2109=False,
-        ))
-    return jar
-
-
 def save_cookies(cookies):
     """保存带完整 domain/path 作用域的 CookieJar。"""
     if not isinstance(cookies, requests.cookies.RequestsCookieJar):
@@ -158,7 +115,7 @@ def save_cookies(cookies):
 
 
 def load_cookies():
-    """从文件加载 cookies（返回 cookiejar 或 dict）"""
+    """从文件加载 cookies（返回 RequestsCookieJar）"""
     if not COOKIES_CACHE_FILE.exists():
         return None
     try:
@@ -270,7 +227,7 @@ def check_cookies_valid(session, cookies, user=""):
     通过访问教务系统页面，检查是否会重定向到 authserver.nuist.edu.cn
     如果 authserver cookies 有效，会自动完成认证并更新 session cookies
     :param session: requests.Session 对象（会被更新 cookies）
-    :param cookies: cookies 字典
+    :param cookies: RequestsCookieJar（保留 domain/path 作用域）
     :return: True 如果有效，False 如果失效，None 如果因网络错误无法判断
     """
     if not cookies:
@@ -510,8 +467,8 @@ def fetch_grades(user, pwd):
             bot = NuistLogin(user, pwd, login_url, headless=True,
                              use_vpn=USE_VPN, vpn_cookies=vpn_cookies,
                              user_agent=COMMON_USER_AGENT)
-            cookie_records = bot.login(cookie_format="scoped")
-            cookies = playwright_cookies_to_jar(cookie_records)
+            # 新版 NuistLogin 直接返回 RequestsCookieJar，保留 domain/path 作用域
+            cookies = bot.login(cookie_format="jar")
             if USE_VPN and bot.vpn_cookies and bot.vpn_cookies != vpn_cookies:
                 save_vpn_cookies(bot.vpn_cookies)
         except Exception as e:

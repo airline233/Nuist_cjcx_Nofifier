@@ -9,6 +9,14 @@ Passkey bundle：
 
     cookies = NuistLogin("202512345678", "passkey.json", service).login()
 
+默认返回 {name: value}，与旧版一致。这种形式会丢掉 domain/path，同名跨域
+Cookie（如 authserver 与 jwxt 各自的 JSESSIONID）只剩最后一条；需要完整
+作用域时传 cookie_format="jar" 拿 CookieJar：
+
+    jar = NuistLogin("202512345678", "passkey.json", service).login(cookie_format="jar")
+    session.cookies.update(jar)              # 或 requests.get(url, cookies=jar)
+    save_cookie_jar(jar, "cookies.txt")      # 落盘 / load_cookie_jar 读回
+
 bundle 由 browser_passkey.js 导出，可以传文件路径、JSON 文本，或已解析的
 dict，需包含 rpId / credentialId / 私钥，以及 userId 和 anonbiometricsd。
 旧版 Playwright 实现保留在 legacy/playwright/NuistLogin.py，仅供参考。
@@ -24,7 +32,7 @@ import html
 import json
 import re
 from enum import IntEnum
-from http.cookiejar import Cookie
+from http.cookiejar import LWPCookieJar
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -32,6 +40,7 @@ from urllib.parse import urljoin, urlsplit
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from requests.cookies import RequestsCookieJar
 
 
 # ==================== 日志级别 ====================
@@ -101,7 +110,7 @@ class NuistLogin:
         log_level: LogLevel = LogLevel.ERROR,
         use_vpn: bool = False,
         vpn_cookies: dict = None,
-        user_agent: str = None
+        user_agent: str | None = None
     ):
         """
         初始化登录器
@@ -123,7 +132,6 @@ class NuistLogin:
         self.use_vpn = use_vpn
         self.vpn_cookies = vpn_cookies or {}
         self.user_agent = user_agent
-        self._cookie_format = "legacy"
         self.session: requests.Session | None = None
 
     # ==================== 日志 ====================
@@ -512,24 +520,34 @@ class NuistLogin:
 
     # ==================== 对外接口 ====================
 
-    def _export_cookies(self, session: requests.Session) -> dict | list[dict]:
-        """按调用方要求导出 Cookie，同时保留旧版返回格式"""
-        if self._cookie_format == "scoped":
-            return [_cookie_record(cookie) for cookie in session.cookies]
+    @staticmethod
+    def _export_cookies(
+        session: requests.Session, cookie_format: str
+    ) -> dict[str, str] | RequestsCookieJar:
+        """
+        按调用方要求导出 Cookie
+
+        legacy 的 {name: value} 会丢掉 domain/path：同名跨域 Cookie（如
+        authserver 和 jwxt 各自的 JSESSIONID）只会留下最后写入的那一条。
+        需要完整作用域时用 jar。
+        """
+        if cookie_format == "jar":
+            return session.cookies
         return session.cookies.get_dict()
 
-    def login(self, cookie_format: str = "legacy") -> dict | list[dict]:
+    def login(self, cookie_format: str = "legacy") -> dict[str, str] | RequestsCookieJar:
         """
         执行登录流程
 
-        :param cookie_format: legacy 返回 {name: value}；scoped 返回完整 Cookie 列表
+        :param cookie_format: legacy（默认，兼容旧调用）返回 {name: value}；
+            jar 返回 RequestsCookieJar，保留 domain/path/secure/expires
         :return: 登录成功后的 cookies
+        :raises ValueError: cookie_format 不合法
         :raises CredentialError: bundle 不可用或 Passkey 被拒绝
         :raises LoginError: 其他登录错误
         """
-        if cookie_format not in ("legacy", "scoped"):
-            raise ValueError(f"不支持的 cookie_format: {cookie_format}")
-        self._cookie_format = cookie_format
+        if cookie_format not in ("legacy", "jar"):
+            raise ValueError(f"不支持的 cookie_format: {cookie_format}（可选 legacy / jar）")
 
         bundle = self._load_bundle()
         private_key = self._load_private_key(bundle)
@@ -548,27 +566,39 @@ class NuistLogin:
         self._log(LogLevel.INFO, "登录成功")
 
         self.session = session
-        return self._export_cookies(session)
+        return self._export_cookies(session, cookie_format)
+
+
+# ==================== Cookie 持久化（标准库 LWP 格式）====================
+
+def save_cookie_jar(jar, path: str | Path):
+    """
+    把 CookieJar 存成标准库的 LWP 文本格式，保留 domain/path/secure/expires
+
+    ignore_discard/ignore_expires 都开着：CAS 的 JSESSIONID、CASTGC 都是
+    会话 Cookie，不写下来等于什么都没存。
+    """
+    lwp = LWPCookieJar(str(path))
+    for cookie in jar:
+        lwp.set_cookie(cookie)
+    lwp.save(ignore_discard=True, ignore_expires=True)
+
+
+def load_cookie_jar(path: str | Path) -> RequestsCookieJar:
+    """
+    读回 save_cookie_jar 写下的文件
+
+    :return: 可直接用于 requests 的 jar，
+        `session.cookies.update(jar)` 或 `requests.get(url, cookies=jar)`
+    """
+    lwp = LWPCookieJar(str(path))
+    lwp.load(ignore_discard=True, ignore_expires=True)
+    jar = RequestsCookieJar()
+    jar.update(lwp)
+    return jar
 
 
 # ==================== 内部工具 ====================
-
-def _cookie_record(cookie: Cookie) -> dict:
-    """
-    把 cookiejar 的 Cookie 转成 Playwright 风格的记录，保留 domain/path
-    等作用域信息（legacy 的 {name: value} 会丢掉这些，导致跨域 Cookie 混用）
-    """
-    return {
-        "name": cookie.name,
-        "value": cookie.value,
-        "domain": cookie.domain or "",
-        "path": cookie.path or "/",
-        "expires": cookie.expires,
-        "httpOnly": cookie.has_nonstandard_attr("HttpOnly"),
-        "secure": bool(cookie.secure),
-        "sameSite": cookie.get_nonstandard_attr("SameSite", None),
-    }
-
 
 def _reject_vpn_sso_page(url: str):
     """落到 VPN 的 SSO 登录页说明 VPN 会话失效，而不是登录成功"""
@@ -591,16 +621,18 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("用法: python NuistLogin.py <学号> <passkey.json> [--vpn] [--vpn-cookies vpn_cookies.json]")
+        print("用法: python NuistLogin.py <学号> <passkey.json> [--vpn] [--vpn-cookies vpn_cookies.json] [--jar]")
         print("示例:")
         print("  python NuistLogin.py 202512345678 passkey.json")
         print("  python NuistLogin.py 202512345678 passkey.json --vpn")
         print("  python NuistLogin.py 202512345678 passkey.json --vpn --vpn-cookies vpn_cookies.json")
+        print("  python NuistLogin.py 202512345678 passkey.json --jar   # 存 LWP 格式，保留 domain/path")
         sys.exit(1)
 
     user = sys.argv[1]
     bundle_path = sys.argv[2]
     use_vpn = "--vpn" in sys.argv
+    as_jar = "--jar" in sys.argv
 
     # 加载可选的 VPN cookies
     vpn_cookies = None
@@ -628,15 +660,24 @@ if __name__ == "__main__":
             vpn_cookies=vpn_cookies
         )
 
-        cookies = bot.login()
+        cookies = bot.login(cookie_format="jar" if as_jar else "legacy")
 
         print("\n[SUCCESS] 获取到的 Cookies:")
-        for name, value in cookies.items():
-            print(f"  {name}: {value[:20]}..." if len(value) > 20 else f"  {name}: {value}")
+        if as_jar:
+            for cookie in cookies:
+                value = cookie.value or ""
+                shown = f"{value[:20]}..." if len(value) > 20 else value
+                print(f"  [{cookie.domain}{cookie.path}] {cookie.name}: {shown}")
 
-        with open("nuist_cookies.json", "w") as f:
-            json.dump(cookies, f)
-        print("\n[*] Cookies 已保存到 nuist_cookies.json")
+            save_cookie_jar(cookies, "nuist_cookies.txt")
+            print("\n[*] Cookies 已保存到 nuist_cookies.txt（LWP 格式，用 load_cookie_jar 读回）")
+        else:
+            for name, value in cookies.items():
+                print(f"  {name}: {value[:20]}..." if len(value) > 20 else f"  {name}: {value}")
+
+            with open("nuist_cookies.json", "w") as f:
+                json.dump(cookies, f)
+            print("\n[*] Cookies 已保存到 nuist_cookies.json")
 
         # VPN 模式下也保存 VPN cookies 供下次使用
         if use_vpn and bot.vpn_cookies:
