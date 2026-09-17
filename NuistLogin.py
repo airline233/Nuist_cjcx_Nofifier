@@ -1,13 +1,36 @@
 """
-NUIST 统一身份认证登录模块
+NUIST 统一身份认证登录模块（Passkey，纯网络层，不启动浏览器）
 支持普通模式和 VPN 模式
+
+调用方式与旧版基于 Playwright 的实现一致，只把第二个参数从密码换成
+Passkey bundle：
+
+    from NuistLogin import NuistLogin
+
+    cookies = NuistLogin("202512345678", "passkey.json", service).login()
+
+bundle 由 browser_passkey.js 导出，可以传文件路径、JSON 文本，或已解析的
+dict，需包含 rpId / credentialId / 私钥，以及 userId 和 anonbiometricsd。
+旧版 Playwright 实现保留在 legacy/playwright/NuistLogin.py，仅供参考。
+
+本模块自成一体，只依赖 requests 和 cryptography。
 """
 
-import time
+from __future__ import annotations
+
+import base64
+import hashlib
+import html
+import json
 import re
 from enum import IntEnum
-from playwright.sync_api import sync_playwright, Page, BrowserContext
-import ddddocr
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin, urlsplit
+
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 
 # ==================== 日志级别 ====================
@@ -21,17 +44,22 @@ class LogLevel(IntEnum):
 # ==================== 自定义异常 ====================
 
 class CaptchaError(Exception):
-    """验证码识别或验证失败"""
+    """保留以兼容旧代码；Passkey 登录不涉及验证码，不会被抛出"""
     pass
 
 
 class CredentialError(Exception):
-    """用户名或密码错误"""
+    """bundle 不可用，或服务端拒绝了本次 Passkey 断言"""
     pass
 
 
 class LoginError(Exception):
     """通用登录错误"""
+    pass
+
+
+class _VpnSessionExpired(LoginError):
+    """内部信号：被重定向到 VPN 的 SSO 登录页，说明 VPN cookies 失效"""
     pass
 
 
@@ -43,38 +71,30 @@ VPN_DOMAIN = "client.vpn.nuist.edu.cn"
 VPN_SSO_LOGIN_PATH = "/enlink/sso/login"
 VPN_CAS_CALLBACK = "https://client.vpn.nuist.edu.cn/enlink/api/client/callback/cas"
 
+LOGIN_PATH = "/authserver/login"
+START_ASSERTION_PATH = "/authserver/startAssertion"
 
-# ==================== 页面选择器 ====================
+# clientDataJSON 里的 origin 必须固定为真实 authserver：即使经 webvpn 代理，
+# 填代理域名会被服务端以 401 拒绝。
+WEBAUTHN_ORIGIN = AUTHSERVER_NORMAL
 
-class Selectors:
-    """页面元素选择器集中管理"""
-    LOGIN_FORM = "#pwdFromId"
-    USERNAME = "#username"
-    PASSWORD = "#password"
-    CAPTCHA_DIV = "#captchaDiv"
-    CAPTCHA_IMG = "#captchaImg"
-    CAPTCHA_INPUT = "#captcha"
-    CAPTCHA_REFRESH = ".captcha-refresh"
-    REMEMBER_ME = "#rememberMe"
-    LOGIN_BUTTON = "#login_submit"
-    ERROR_TIP = "#showErrorTip"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0"
+)
+REDIRECT_CODES = (301, 302, 303, 307, 308)
 
 
 # ==================== 主类 ====================
 
 class NuistLogin:
-    """NUIST 统一身份认证登录器"""
-    
-    # 常量配置
-    MAX_CAPTCHA_RETRIES = 10      # 验证码识别最大重试次数
-    MAX_LOGIN_RETRIES = 3         # 登录最大重试次数（验证码错误时）
-    PAGE_LOAD_TIMEOUT = 30000     # 页面加载超时 (ms)
-    LOGIN_REDIRECT_TIMEOUT = 8000 # 登录跳转超时 (ms)
-    
+    """NUIST 统一身份认证登录器（Passkey）"""
+
+    TIMEOUT = 30  # 单次请求超时 (s)
+
     def __init__(
         self,
         username: str,
-        password: str,
+        passkey: str | Path | dict[str, Any],
         service: str,
         headless: bool = True,
         log_level: LogLevel = LogLevel.ERROR,
@@ -83,28 +103,26 @@ class NuistLogin:
     ):
         """
         初始化登录器
-        
-        :param username: 学号
-        :param password: 密码
+
+        :param username: 学号；bundle 内已含 userId 时可留空
+        :param passkey: Passkey bundle，文件路径 / JSON 文本 / dict
         :param service: 登录成功后跳转的服务 URL（始终使用原始 URL）
-        :param headless: 是否使用无头浏览器
+        :param headless: 兼容旧调用而保留，不起作用（不启动浏览器）
         :param log_level: 日志级别
         :param use_vpn: 是否使用 VPN 模式
         :param vpn_cookies: VPN cookies 字典（可选，无则自动获取）
         """
         self.username = username
-        self.password = password
+        self.passkey = passkey
         self.service = service
         self.headless = headless
         self.log_level = log_level
         self.use_vpn = use_vpn
         self.vpn_cookies = vpn_cookies or {}
-        
-        # 初始化 OCR
-        self.ocr = ddddocr.DdddOcr(show_ad=False)
+        self.session: requests.Session | None = None
 
     # ==================== 日志 ====================
-    
+
     def _log(self, level: LogLevel, message: str):
         """分级日志输出"""
         if level >= self.log_level:
@@ -115,400 +133,442 @@ class NuistLogin:
             }
             print(f"{prefix.get(level, '[?]')} {message}")
 
-    # ==================== 浏览器管理 ====================
-    
-    def _setup_browser_context(self, playwright) -> BrowserContext:
-        """创建并配置浏览器上下文"""
-        browser = playwright.chromium.launch(headless=self.headless)
-        context = browser.new_context()
-        return context
-    
-    def _load_vpn_cookies(self, context: BrowserContext):
-        """将 VPN cookies 加载到浏览器上下文"""
-        if self.vpn_cookies:
-            self._log(LogLevel.TRACE, "加载 VPN cookies...")
-            vpn_cookie_list = [
-                {"name": name, "value": value, "domain": VPN_DOMAIN, "path": "/"}
-                for name, value in self.vpn_cookies.items()
-            ]
-            context.add_cookies(vpn_cookie_list)
-    
-    def _extract_vpn_cookies(self, cookies: list) -> dict:
-        """从 cookies 列表中提取 VPN 域名的 cookies"""
+    # ==================== 凭据加载 ====================
+
+    def _load_bundle(self) -> dict[str, Any]:
+        """bundle 可以是 dict、JSON 文本或 JSON 文件路径"""
+        source = self.passkey
+        if isinstance(source, dict):
+            data: Any = source
+        else:
+            text = str(source).strip()
+            if text.startswith("{"):
+                raw = text
+            else:
+                try:
+                    raw = Path(source).read_text(encoding="utf-8")
+                except OSError as e:
+                    raise CredentialError(f"读取 bundle 失败: {e}") from e
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise CredentialError(f"解析 bundle 失败: {e}") from e
+
+        if not isinstance(data, dict):
+            raise CredentialError("bundle 必须是 JSON 对象")
+        for name in ("rpId", "credentialId"):
+            if not data.get(name):
+                raise CredentialError(f"bundle 缺少字段: {name}")
+        if not data.get("privateKeyPkcs8Pem") and not data.get("privateKeyJwk"):
+            raise CredentialError("bundle 缺少 privateKeyPkcs8Pem/privateKeyJwk")
+        return data
+
+    @staticmethod
+    def _load_private_key(bundle: dict) -> ec.EllipticCurvePrivateKey:
+        """加载 bundle 中的 ES256 私钥"""
+        try:
+            if bundle.get("privateKeyPkcs8Pem"):
+                key = serialization.load_pem_private_key(
+                    bundle["privateKeyPkcs8Pem"].encode("ascii"), password=None
+                )
+            else:
+                jwk = bundle["privateKeyJwk"]
+                scalar = int.from_bytes(_b64url_decode(jwk["d"]), "big")
+                key = ec.derive_private_key(scalar, ec.SECP256R1())
+        except (KeyError, ValueError, TypeError, base64.binascii.Error) as e:
+            raise CredentialError(f"passkey 私钥无法解析: {e}") from e
+
+        if not isinstance(key, ec.EllipticCurvePrivateKey) or not isinstance(
+            key.curve, ec.SECP256R1
+        ):
+            raise CredentialError("passkey 私钥必须是 P-256/ES256")
+        return key
+
+    def _resolve_ids(self, bundle: dict) -> tuple[str, str]:
+        """返回 (userId, startId)；userId 是学号的 Base64URL 形式"""
+        user_id = bundle.get("userId")
+        if not user_id and self.username:
+            user_id = _b64url_encode(self.username.encode("utf-8"))
+        if not user_id:
+            raise CredentialError("缺少 userId：请使用新 bundle，或传入 username")
+
+        start_id = bundle.get("anonbiometricsd")
+        if not start_id:
+            raise CredentialError("缺少 anonbiometricsd：请使用新 bundle")
+        return user_id, start_id
+
+    # ==================== 会话与 URL ====================
+
+    def _new_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "zh-CN,en;q=0.9,en-US;q=0.8",
+        })
+        return session
+
+    @staticmethod
+    def _login_url(base: str, service: str) -> str:
+        """拼登录页 URL；base 为普通或 webvpn 代理前缀"""
+        url = f"{base}{LOGIN_PATH}"
+        if not service:
+            return url
+        return f"{url}?service={requests.utils.quote(service, safe=':/')}"
+
+    @staticmethod
+    def _http_origin(base: str) -> str:
+        """HTTP 请求头里的 Origin，与实际访问的主机一致"""
+        parts = urlsplit(base)
+        return f"{parts.scheme}://{parts.netloc}"
+
+    # ==================== CAS + WebAuthn 流程 ====================
+
+    def _open_login_page(self, session: requests.Session, login_url: str) -> tuple[str | None, str]:
+        """
+        访问登录页，取得会话 Cookie 和 execution 令牌
+
+        :return: (execution, 落地 URL)；已登录自动跳转时 execution 为 None
+        """
+        response = session.get(
+            login_url,
+            headers={"Accept": "text/html,application/xhtml+xml"},
+            timeout=self.TIMEOUT,
+        )
+        response.raise_for_status()
+
+        # SSO 已登录时会直接跳走，不再需要提交断言
+        if LOGIN_PATH not in response.url:
+            return None, response.url
+
+        # execution 位于登录页隐藏 input；抓包值 e1s1 作为后备
+        match = re.search(
+            r'name=["\']execution["\'][^>]*value=["\']([^"\']+)',
+            html.unescape(response.text),
+            re.IGNORECASE,
+        )
+        execution = match.group(1) if match else "e1s1"
+        self._log(LogLevel.TRACE, f"execution={execution}")
+        return execution, response.url
+
+    def _start_assertion(
+        self,
+        session: requests.Session,
+        base: str,
+        login_url: str,
+        user_id: str,
+        start_id: str,
+    ) -> dict:
+        """请求 WebAuthn 断言参数（challenge 等）"""
+        response = session.post(
+            f"{base}{START_ASSERTION_PATH}",
+            json={"userId": user_id, "id": start_id},
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Content-Type": "application/json;charset=utf-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": self._http_origin(base),
+                "Referer": login_url,
+            },
+            timeout=self.TIMEOUT,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if body.get("success") is False:
+            raise CredentialError(f"startAssertion 失败: {body}")
+
+        request = body.get("result", {}).get("request")
+        if not isinstance(request, dict):
+            request = body.get("datas", {}).get("request")
+        if not isinstance(request, dict) or not request.get("requestId"):
+            raise LoginError(f"startAssertion 响应中没有有效的 request: {body}")
+        return request
+
+    def _make_assertion(
+        self,
+        request_data: dict,
+        bundle: dict,
+        private_key: ec.EllipticCurvePrivateKey,
+    ) -> dict:
+        """用 bundle 里的私钥离线完成 WebAuthn 断言签名"""
+        options = request_data.get("publicKeyCredentialRequestOptions", {})
+        challenge = options.get("challenge")
+        rp_id = options.get("rpId") or bundle["rpId"]
+        credential_id = bundle["credentialId"]
+        if not challenge or not rp_id:
+            raise LoginError("startAssertion 缺少 challenge/rpId")
+
+        allowed = options.get("allowCredentials") or []
+        if allowed and credential_id not in {
+            item.get("id") for item in allowed if isinstance(item, dict)
+        }:
+            raise CredentialError(
+                "bundle 中的 credentialId 不在 allowCredentials 中，"
+                "该 Passkey 可能已被吊销"
+            )
+
+        client_data_json = json.dumps(
+            {
+                "type": "webauthn.get",
+                "challenge": challenge,
+                "origin": WEBAUTHN_ORIGIN,
+                "crossOrigin": False,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        # 前端要求 userVerification，故 flags = UP(0x01) | UV(0x04)；计数器固定 0
+        authenticator_data = (
+            hashlib.sha256(rp_id.encode("utf-8")).digest()
+            + b"\x05"
+            + b"\x00\x00\x00\x00"
+        )
+        # WebAuthn ES256 签名为 DER 编码
+        signature = private_key.sign(
+            authenticator_data + hashlib.sha256(client_data_json).digest(),
+            ec.ECDSA(hashes.SHA256()),
+        )
         return {
-            item['name']: item['value'] 
-            for item in cookies 
-            if VPN_DOMAIN in item.get('domain', '')
+            "type": "public-key",
+            "id": credential_id,
+            "response": {
+                "authenticatorData": _b64url_encode(authenticator_data),
+                "clientDataJSON": _b64url_encode(client_data_json),
+                "signature": _b64url_encode(signature),
+            },
+            "clientExtensionResults": {"appid": False},
         }
 
-    # ==================== 页面检查 ====================
-    
-    def _is_vpn_login_redirect(self, page: Page) -> bool:
-        """检查是否被重定向到 VPN 登录页"""
-        return self.use_vpn and VPN_SSO_LOGIN_PATH in page.url
+    def _submit_login(
+        self,
+        session: requests.Session,
+        base: str,
+        login_url: str,
+        user_id: str,
+        request_data: dict,
+        credential: dict,
+        execution: str,
+    ) -> requests.Response:
+        """提交断言到 CAS 登录表单"""
+        response_json = json.dumps(
+            {
+                "requestId": request_data["requestId"],
+                "credential": credential,
+                "sessionToken": None,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return session.post(
+            login_url,
+            data={
+                "_eventId": "submit",
+                # username 字段发的是 Base64URL 的 userId，不是明文学号，
+                # 传明文学号会被服务端以 401 拒绝。
+                "username": user_id,
+                "responseJson": response_json,
+                "cllt": "fidoLogin",
+                "dllt": "generalLogin",
+                "lt": "",
+                "execution": execution,
+            },
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": self._http_origin(base),
+                "Referer": login_url,
+                "Upgrade-Insecure-Requests": "1",
+            },
+            allow_redirects=False,
+            timeout=self.TIMEOUT,
+        )
 
-    def _is_on_login_page(self, page: Page) -> bool:
-        """检查是否在 authserver 登录页"""
-        return "authserver/login" in page.url
-
-    def _wait_for_login_page(self, page: Page):
-        """等待登录页面加载完成"""
-        self._log(LogLevel.TRACE, "等待登录页面加载...")
-        try:
-            page.wait_for_selector(Selectors.LOGIN_FORM, timeout=self.PAGE_LOAD_TIMEOUT)
-        except Exception as e:
-            raise LoginError(f"登录页面加载失败: {e}")
-
-    # ==================== 验证码处理 ====================
-    
-    def _is_captcha_visible(self, page: Page) -> bool:
-        """检查验证码是否可见"""
-        captcha_div = page.locator(Selectors.CAPTCHA_DIV)
-        return captcha_div.is_visible()
-
-    def _recognize_captcha(self, page: Page) -> str:
+    def _passkey_login(
+        self,
+        session: requests.Session,
+        base: str,
+        service: str,
+        bundle: dict,
+        private_key: ec.EllipticCurvePrivateKey,
+        user_id: str,
+        start_id: str,
+    ) -> str:
         """
-        识别验证码，自动刷新直到获得有效格式
-        
-        :return: 4位字母数字验证码
-        :raises CaptchaError: 多次尝试后仍无法获取有效验证码
+        在指定 authserver（普通或 webvpn 代理）上完成一次 Passkey 登录
+
+        :return: 跟随跳转后的落地 URL
         """
-        for attempt in range(self.MAX_CAPTCHA_RETRIES):
-            # 等待验证码图片加载
-            page.wait_for_selector(Selectors.CAPTCHA_IMG, state="visible")
-            img_bytes = page.locator(Selectors.CAPTCHA_IMG).screenshot()
-            
-            # OCR 识别
-            code = self.ocr.classification(img_bytes)
-            self._log(LogLevel.TRACE, f"验证码识别 [{attempt + 1}/{self.MAX_CAPTCHA_RETRIES}]: {code}")
-            
-            # 验证格式：4位字母数字
-            if re.match(r'^[a-zA-Z0-9]{4}$', code):
-                self._log(LogLevel.TRACE, f"验证码格式有效: {code}")
-                return code
-            
-            # 格式无效，刷新验证码
-            self._log(LogLevel.TRACE, "验证码格式无效，刷新中...")
-            page.locator(Selectors.CAPTCHA_REFRESH).click()
-            time.sleep(0.5)
-        
-        raise CaptchaError(f"验证码识别失败：连续 {self.MAX_CAPTCHA_RETRIES} 次未获取有效格式")
-
-    def _fill_captcha(self, page: Page):
-        """填写验证码（如果需要）"""
-        time.sleep(0.3)  # 等待验证码区域状态稳定
-        
-        if self._is_captcha_visible(page):
-            self._log(LogLevel.INFO, "检测到验证码，开始识别...")
-            code = self._recognize_captcha(page)
-            page.fill(Selectors.CAPTCHA_INPUT, code)
-            self._log(LogLevel.TRACE, f"已填写验证码: {code}")
-        else:
-            self._log(LogLevel.TRACE, "无需验证码")
-
-    # ==================== 表单操作 ====================
-    
-    def _fill_credentials(self, page: Page):
-        """填写用户名和密码"""
-        self._log(LogLevel.TRACE, "填写登录凭据...")
-        page.fill(Selectors.USERNAME, self.username)
-        page.fill(Selectors.PASSWORD, self.password)
-
-    def _check_remember_me(self, page: Page):
-        """勾选记住我（如果可见）"""
-        remember_me = page.locator(Selectors.REMEMBER_ME)
-        if remember_me.is_visible():
-            remember_me.check()
-            self._log(LogLevel.TRACE, "已勾选「记住我」")
-
-    def _submit_login(self, page: Page):
-        """提交登录表单"""
-        self._log(LogLevel.TRACE, "提交登录表单...")
-        page.click(Selectors.LOGIN_BUTTON)
-
-    # ==================== 登录结果判断 ====================
-    
-    def _check_login_error(self, page: Page) -> str | None:
-        """
-        检查页面上的错误提示
-        
-        :return: 错误信息，如果没有错误返回 None
-        """
-        error_tip = page.locator(Selectors.ERROR_TIP)
-        if error_tip.is_visible():
-            error_msg = error_tip.inner_text().strip()
-            if error_msg:
-                return error_msg
-        return None
-
-    def _is_login_successful(self, page: Page) -> bool:
-        """判断是否登录成功（已离开登录页面）"""
-        current_url = page.url
-        
-        # 仍在登录页面
-        if "authserver/login" in current_url:
-            return False
-        
-        # VPN 模式：检查是否在 VPN 域名下（但不是 SSO 登录页）
-        if self.use_vpn:
-            return VPN_DOMAIN in current_url and VPN_SSO_LOGIN_PATH not in current_url
-        
-        # 普通模式：检查是否离开了 authserver
-        return "authserver.nuist.edu.cn" not in current_url
-
-    def _wait_for_redirect(self, page: Page):
-        """
-        等待登录后的页面跳转
-        
-        :raises CaptchaError: 验证码错误
-        :raises CredentialError: 用户名或密码错误
-        :raises LoginError: 其他登录错误
-        """
-        try:
-            # 等待 URL 变化（离开登录页）
-            page.wait_for_url(
-                lambda url: "authserver/login" not in url,
-                timeout=self.LOGIN_REDIRECT_TIMEOUT
-            )
-            self._log(LogLevel.TRACE, "页面已跳转")
-            return
-        except Exception:
-            pass  # 超时，继续检查错误
-        
-        # 检查页面错误提示
-        error_msg = self._check_login_error(page)
-        if error_msg:
-            if "图形动态码错误" in error_msg or "验证码" in error_msg:
-                raise CaptchaError(f"验证码错误: {error_msg}")
-            elif "用户名或者密码有误" in error_msg:
-                raise CredentialError(f"凭据错误: {error_msg}")
-            else:
-                raise LoginError(f"登录失败: {error_msg}")
-        
-        # 再次检查是否实际上已成功
-        if self._is_login_successful(page):
-            self._log(LogLevel.TRACE, "登录成功")
-            return
-        
-        # 未知状态
-        raise LoginError(f"登录状态未知，当前 URL: {page.url}")
-
-    # ==================== 核心登录流程 ====================
-    
-    def _do_login_attempt(self, page: Page, login_url: str) -> bool:
-        """
-        执行单次登录尝试
-        
-        :param page: 浏览器页面
-        :param login_url: 登录 URL
-        :return: True 如果需要登录并完成，False 如果已登录自动跳转
-        :raises CaptchaError: 验证码错误（可重试）
-        :raises CredentialError: 凭据错误（不可重试）
-        :raises LoginError: 其他错误
-        """
+        login_url = self._login_url(base, service)
         self._log(LogLevel.TRACE, f"访问: {login_url[:80]}...")
-        page.goto(login_url)
-        
-        # SSO cookies 持久化：如果已登录，会自动重定向到目标页面
-        if not self._is_on_login_page(page):
+        execution, landing = self._open_login_page(session, login_url)
+        if execution is None:
+            _reject_vpn_sso_page(landing)
             self._log(LogLevel.INFO, "SSO 已登录，自动跳转")
-            return False
-        
-        # 等待页面加载
-        self._wait_for_login_page(page)
-        
-        # 填写凭据
-        self._fill_credentials(page)
-        
-        # 处理验证码
-        self._fill_captcha(page)
-        
-        # 勾选记住我
-        self._check_remember_me(page)
-        
-        # 提交表单
-        self._submit_login(page)
-        
-        # 等待结果
-        self._wait_for_redirect(page)
-        return True
+            return landing
 
-    def _acquire_vpn_cookies(self, context: BrowserContext, page: Page):
-        """
-        通过 authserver 登录 VPN CAS 回调，获取 VPN cookies
-        
-        :param context: 浏览器上下文
-        :param page: 浏览器页面
-        """
+        self._log(LogLevel.INFO, "提交 Passkey 断言...")
+        request_data = self._start_assertion(session, base, login_url, user_id, start_id)
+        credential = self._make_assertion(request_data, bundle, private_key)
+        response = self._submit_login(
+            session, base, login_url, user_id, request_data, credential, execution
+        )
+        if response.status_code not in REDIRECT_CODES:
+            raise CredentialError(
+                f"登录未返回重定向: HTTP {response.status_code}；"
+                "Passkey 可能已失效，请重新注册"
+            )
+
+        location = response.headers.get("Location", "")
+        if not location:
+            raise LoginError("登录返回重定向但缺少 Location")
+
+        landed = session.get(
+            urljoin(login_url, location), allow_redirects=True, timeout=self.TIMEOUT
+        )
+        self._log(LogLevel.TRACE, f"落地页: {landed.url[:100]}")
+        _reject_vpn_sso_page(landed.url)
+        if LOGIN_PATH in landed.url:
+            raise LoginError(f"登录后又跳回认证页，service 可能不正确: {service}")
+        return landed.url
+
+    # ==================== VPN 模式 ====================
+
+    @staticmethod
+    def _extract_vpn_cookies(session: requests.Session) -> dict:
+        """从会话中提取 VPN 域名的 cookies"""
+        return {
+            cookie.name: cookie.value
+            for cookie in session.cookies
+            if VPN_DOMAIN in (cookie.domain or "")
+        }
+
+    def _load_vpn_cookies(self, session: requests.Session):
+        """将 VPN cookies 写入会话"""
+        self._log(LogLevel.TRACE, "加载 VPN cookies...")
+        for name, value in self.vpn_cookies.items():
+            session.cookies.set(name, value, domain=VPN_DOMAIN, path="/")
+
+    def _clear_vpn_cookies(self, session: requests.Session):
+        for cookie in list(session.cookies):
+            if VPN_DOMAIN in (cookie.domain or ""):
+                session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+
+    def _acquire_vpn_cookies(
+        self,
+        session: requests.Session,
+        bundle: dict,
+        private_key: ec.EllipticCurvePrivateKey,
+        user_id: str,
+        start_id: str,
+    ):
+        """在普通网络下登录 VPN 的 CAS 回调，换取 VPN cookies"""
         self._log(LogLevel.INFO, "获取 VPN cookies...")
-        
-        vpn_login_url = f"{AUTHSERVER_NORMAL}/authserver/login?service={VPN_CAS_CALLBACK}"
-        
-        last_error = None
-        for attempt in range(self.MAX_LOGIN_RETRIES):
-            try:
-                if attempt > 0:
-                    self._log(LogLevel.INFO, f"重试获取 VPN cookies [{attempt + 1}/{self.MAX_LOGIN_RETRIES}]...")
-                
-                self._do_login_attempt(page, vpn_login_url)
-                
-                # 提取 VPN cookies
-                all_cookies = context.cookies()
-                self.vpn_cookies = self._extract_vpn_cookies(all_cookies)
-                
-                if self.vpn_cookies:
-                    self._log(LogLevel.INFO, f"已获取 VPN cookies ({len(self.vpn_cookies)} 个)")
-                    return
-                else:
-                    raise LoginError("登录成功但未获取到 VPN cookies")
-                    
-            except CaptchaError as e:
-                last_error = e
-                self._log(LogLevel.TRACE, f"验证码错误: {e}")
-                continue
-        
-        raise CaptchaError(f"获取 VPN cookies 失败: {last_error}")
+        self._clear_vpn_cookies(session)
+        self._passkey_login(
+            session, AUTHSERVER_NORMAL, VPN_CAS_CALLBACK, bundle, private_key,
+            user_id, start_id,
+        )
+        self.vpn_cookies = self._extract_vpn_cookies(session)
+        if not self.vpn_cookies:
+            raise LoginError("登录成功但未获取到 VPN cookies")
+        self._log(LogLevel.INFO, f"已获取 VPN cookies ({len(self.vpn_cookies)} 个)")
 
-    def _login_with_vpn(self, context: BrowserContext, page: Page) -> dict:
+    def _login_vpn(
+        self,
+        session: requests.Session,
+        bundle: dict,
+        private_key: ec.EllipticCurvePrivateKey,
+        user_id: str,
+        start_id: str,
+    ):
         """
         VPN 模式登录流程
-        
-        :return: 最终的 cookies 字典
+
+        VPN cookies 是否有效无法靠预先探测判断（webvpn 对失效会话也会返回
+        200 的访客页），因此直接拿现有 cookies 试一次，被踢回 SSO 登录页
+        再重新获取。
         """
-        self._log(LogLevel.INFO, "VPN 模式登录...")
-        
-        # 尝试使用现有 VPN cookies
         if self.vpn_cookies:
-            self._load_vpn_cookies(context)
-            
-            # 尝试访问 VPN 版 authserver
-            vpn_login_url = f"{AUTHSERVER_VPN}/authserver/login?service={self.service}"
-            self._log(LogLevel.TRACE, f"尝试使用现有 VPN cookies...")
-            page.goto(vpn_login_url)
-            
-            # 检查 VPN cookies 是否有效
-            if not self._is_vpn_login_redirect(page):
-                self._log(LogLevel.INFO, "VPN cookies 有效")
-                # cookies 有效，继续登录流程
-                return self._complete_vpn_login(context, page, vpn_login_url)
-            
-            self._log(LogLevel.INFO, "VPN cookies 已失效，重新获取...")
-        
-        # 需要获取新的 VPN cookies
-        self._acquire_vpn_cookies(context, page)
-        
-        # 重新加载 VPN cookies
-        self._load_vpn_cookies(context)
-        
-        # 使用新 cookies 登录
-        vpn_login_url = f"{AUTHSERVER_VPN}/authserver/login?service={self.service}"
-        return self._complete_vpn_login(context, page, vpn_login_url)
-
-    def _complete_vpn_login(self, context: BrowserContext, page: Page, login_url: str) -> dict:
-        """
-        完成 VPN 登录流程（已有有效 VPN cookies）
-        
-        :return: cookies 字典
-        """
-        last_error = None
-        
-        for attempt in range(self.MAX_LOGIN_RETRIES):
+            self._load_vpn_cookies(session)
             try:
-                if attempt > 0:
-                    self._log(LogLevel.INFO, f"登录重试 [{attempt + 1}/{self.MAX_LOGIN_RETRIES}]...")
-                
-                # 访问目标 service 的登录页
-                page.goto(login_url)
-                
-                # SSO 已登录则自动跳转
-                if not self._is_on_login_page(page):
-                    self._log(LogLevel.INFO, "登录成功（SSO 自动认证）")
-                    break
-                
-                self._do_login_attempt(page, login_url)
-                self._log(LogLevel.INFO, "登录成功")
-                break
-                
-            except CaptchaError as e:
-                last_error = e
-                self._log(LogLevel.TRACE, f"验证码错误: {e}")
-                continue
-        else:
-            raise CaptchaError(f"登录失败: {last_error}")
-        
-        # 返回所有 cookies
-        all_cookies = context.cookies()
-        return {item['name']: item['value'] for item in all_cookies}
+                self._passkey_login(
+                    session, AUTHSERVER_VPN, self.service, bundle, private_key,
+                    user_id, start_id,
+                )
+                return
+            except _VpnSessionExpired:
+                self._log(LogLevel.INFO, "VPN cookies 已失效，重新获取...")
 
-    def _login_normal(self, context: BrowserContext, page: Page) -> dict:
-        """
-        普通模式登录流程
-        
-        :return: cookies 字典
-        """
-        self._log(LogLevel.INFO, "普通模式登录...")
-        
-        login_url = f"{AUTHSERVER_NORMAL}/authserver/login?service={self.service}"
-        last_error = None
-        
-        for attempt in range(self.MAX_LOGIN_RETRIES):
-            try:
-                if attempt > 0:
-                    self._log(LogLevel.INFO, f"登录重试 [{attempt + 1}/{self.MAX_LOGIN_RETRIES}]...")
-                
-                self._do_login_attempt(page, login_url)
-                self._log(LogLevel.INFO, "登录成功")
-                
-                all_cookies = context.cookies()
-                return {item['name']: item['value'] for item in all_cookies}
-                
-            except CaptchaError as e:
-                last_error = e
-                self._log(LogLevel.TRACE, f"验证码错误: {e}")
-                continue
-        
-        raise CaptchaError(f"登录失败: {last_error}")
+        self._acquire_vpn_cookies(session, bundle, private_key, user_id, start_id)
+        self._passkey_login(
+            session, AUTHSERVER_VPN, self.service, bundle, private_key,
+            user_id, start_id,
+        )
+
+    # ==================== 对外接口 ====================
 
     def login(self) -> dict:
         """
         执行登录流程
-        
+
         :return: 登录成功后的 cookies 字典
-        :raises CredentialError: 用户名或密码错误
-        :raises CaptchaError: 验证码多次失败
+        :raises CredentialError: bundle 不可用或 Passkey 被拒绝
         :raises LoginError: 其他登录错误
         """
-        with sync_playwright() as playwright:
-            context = self._setup_browser_context(playwright)
-            page = context.new_page()
-            
-            try:
-                if self.use_vpn:
-                    return self._login_with_vpn(context, page)
-                else:
-                    return self._login_normal(context, page)
-            finally:
-                context.browser.close()
+        bundle = self._load_bundle()
+        private_key = self._load_private_key(bundle)
+        user_id, start_id = self._resolve_ids(bundle)
+
+        session = self._new_session()
+        if self.use_vpn:
+            self._log(LogLevel.INFO, "VPN 模式登录...")
+            self._login_vpn(session, bundle, private_key, user_id, start_id)
+        else:
+            self._log(LogLevel.INFO, "普通模式登录...")
+            self._passkey_login(
+                session, AUTHSERVER_NORMAL, self.service, bundle, private_key,
+                user_id, start_id,
+            )
+        self._log(LogLevel.INFO, "登录成功")
+
+        self.session = session
+        return session.cookies.get_dict()
+
+
+# ==================== 内部工具 ====================
+
+def _reject_vpn_sso_page(url: str):
+    """落到 VPN 的 SSO 登录页说明 VPN 会话失效，而不是登录成功"""
+    if VPN_DOMAIN in url and VPN_SSO_LOGIN_PATH in url:
+        raise _VpnSessionExpired(f"被重定向到 VPN 登录页: {url[:100]}")
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    value = value.replace("-", "+").replace("_", "/")
+    return base64.b64decode(value + "=" * (-len(value) % 4))
 
 
 # ==================== 命令行入口 ====================
 
 if __name__ == "__main__":
     import sys
-    import json
-    
+
     if len(sys.argv) < 3:
-        print("用法: python NuistLogin.py <学号> <密码> [--vpn] [--vpn-cookies vpn_cookies.json]")
+        print("用法: python NuistLogin.py <学号> <passkey.json> [--vpn] [--vpn-cookies vpn_cookies.json]")
         print("示例:")
-        print("  python NuistLogin.py 202512345678 yourpassword")
-        print("  python NuistLogin.py 202512345678 yourpassword --vpn")
-        print("  python NuistLogin.py 202512345678 yourpassword --vpn --vpn-cookies vpn_cookies.json")
+        print("  python NuistLogin.py 202512345678 passkey.json")
+        print("  python NuistLogin.py 202512345678 passkey.json --vpn")
+        print("  python NuistLogin.py 202512345678 passkey.json --vpn --vpn-cookies vpn_cookies.json")
         sys.exit(1)
-    
+
     user = sys.argv[1]
-    pwd = sys.argv[2]
+    bundle_path = sys.argv[2]
     use_vpn = "--vpn" in sys.argv
-    
+
     # 加载可选的 VPN cookies
     vpn_cookies = None
     if "--vpn-cookies" in sys.argv:
@@ -521,36 +581,36 @@ if __name__ == "__main__":
                 print(f"[*] 已加载 VPN cookies: {vpn_cookies_file}")
             except FileNotFoundError:
                 print(f"[!] VPN cookies 文件不存在: {vpn_cookies_file}")
-    
+
     try:
         service = "https://jwxt.nuist.edu.cn/jwapp/sys/emaphome/portal/index.do"
-        
+
         bot = NuistLogin(
             username=user,
-            password=pwd,
+            passkey=bundle_path,
             service=service,
             headless=False,
             log_level=LogLevel.INFO,
             use_vpn=use_vpn,
             vpn_cookies=vpn_cookies
         )
-        
+
         cookies = bot.login()
-        
+
         print("\n[SUCCESS] 获取到的 Cookies:")
         for name, value in cookies.items():
             print(f"  {name}: {value[:20]}..." if len(value) > 20 else f"  {name}: {value}")
-        
+
         with open("nuist_cookies.json", "w") as f:
             json.dump(cookies, f)
         print("\n[*] Cookies 已保存到 nuist_cookies.json")
-        
+
         # VPN 模式下也保存 VPN cookies 供下次使用
         if use_vpn and bot.vpn_cookies:
             with open("vpn_cookies.json", "w") as f:
                 json.dump(bot.vpn_cookies, f)
             print("[*] VPN Cookies 已保存到 vpn_cookies.json")
-        
+
     except CredentialError as e:
         print(f"\n[CREDENTIAL ERROR] {e}")
         sys.exit(3)

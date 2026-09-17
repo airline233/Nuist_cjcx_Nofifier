@@ -58,19 +58,19 @@ playwright install chromium
 #### 单次运行
 
 ```bash
-python main.py -u <学号> -p <密码> -qq <QQ号>
+python main.py -u <学号> -p <Passkey JSON> -qq <QQ号>
 ```
 
 #### 完整参数
 
 ```bash
-python main.py -u <学号> -p <密码> -qq <QQ号> [--webhook <OneBot地址>] [--multi] [--vpn]
+python main.py -u <学号> -p <Passkey JSON> -qq <QQ号> [--webhook <OneBot地址>] [--multi] [--vpn]
 ```
 
 | 参数 | 必填 | 说明 | 默认值 |
 |------|------|------|--------|
-| `-u, --user` | ✅ | 教务系统学号 | - |
-| `-p, --password` | ✅ | 教务系统密码 | - |
+| `-u, --user` | ✅ | CAS系统学号 | - |
+| `-p, --password` | ✅ | CAS系统Passkey JSON | - |
 | `-qq, --qq` | ✅ | 接收通知的 QQ 号 | - |
 | `--webhook` | ❌ | OneBot HTTP API 地址 | `http://127.0.0.1:3000/send_private_msg` |
 | `--multi` | ❌ | 多用户模式（通知中显示学号） | `False` |
@@ -82,7 +82,7 @@ python main.py -u <学号> -p <密码> -qq <QQ号> [--webhook <OneBot地址>] [-
 当无法直接访问校园网时，可以使用 WebVPN 模式：
 
 ```bash
-python main.py -u <学号> -p <密码> -qq <QQ号> --vpn
+python main.py -u <学号> -p <Passkey JSON> -qq <QQ号> --vpn
 ```
 
 > ⚠️ **注意**：使用 VPN 模式前，需要先准备 `vpn_cookies.json` 文件。可以使用 `NuistLogin.py` 工具生成（详见下方独立使用说明）。
@@ -92,7 +92,7 @@ python main.py -u <学号> -p <密码> -qq <QQ号> --vpn
 **Linux (crontab)**
 ```bash
 # 每 30 分钟检查一次
-*/30 * * * * cd /path/to/cjcx && python main.py -u 学号 -p 密码 -qq QQ号
+*/30 * * * * cd /path/to/cjcx && python main.py -u 学号 -p Passkey JSON -qq QQ号
 ```
 
 **Windows (任务计划程序)**
@@ -124,25 +124,27 @@ python main.py -u <学号> -p <密码> -qq <QQ号> --vpn
 
 ```bash
 # 基本用法（登录并保存 Cookies）
-python NuistLogin.py <学号> <密码>
+python NuistLogin.py <学号> <Passkey JSON>
 
 # 使用 VPN 模式
-python NuistLogin.py <学号> <密码> --vpn
+python NuistLogin.py <学号> <Passkey JSON> --vpn
 
 # 显示浏览器窗口（调试用）
-python NuistLogin.py <学号> <密码> --no-headless
+python NuistLogin.py <学号> <Passkey JSON> --no-headless
 
 # 完整参数
-python NuistLogin.py <学号> <密码> [--vpn] [--no-headless] [--verbose]
+python NuistLogin.py <学号> <Passkey JSON> [--vpn] [--no-headless] [--verbose]
 ```
 
 | 参数 | 说明 |
 |------|------|
 | `学号` | NUIST 学号（必填） |
-| `密码` | 统一身份认证密码（必填） |
+| `Passkey JSON` | 统一身份认证Passkey JSON相对或绝对路径（必填） |
 | `--vpn` | 使用 WebVPN 模式 |
 | `--no-headless` | 显示浏览器窗口 |
 | `--verbose` | 显示详细日志 |
+
+关于 Passkey JSON 的获取方法，请参考 [Passkey 获取教程](https://github.com/airline233/nuist-authserver-login)
 
 ### 作为模块导入
 
@@ -152,7 +154,7 @@ from NuistLogin import NuistLogin, LogLevel
 # 创建登录器
 bot = NuistLogin(
     username="202512345678",
-    password="your_password",
+    password="passkey.json",
     service="https://jwxt.nuist.edu.cn/jwapp/sys/emaphome/portal/index.do",
     headless=True,           # 无头模式
     log_level=LogLevel.INFO, # 日志级别
