@@ -24,6 +24,7 @@ import html
 import json
 import re
 from enum import IntEnum
+from http.cookiejar import Cookie
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -99,7 +100,8 @@ class NuistLogin:
         headless: bool = True,
         log_level: LogLevel = LogLevel.ERROR,
         use_vpn: bool = False,
-        vpn_cookies: dict = None
+        vpn_cookies: dict = None,
+        user_agent: str = None
     ):
         """
         初始化登录器
@@ -111,6 +113,7 @@ class NuistLogin:
         :param log_level: 日志级别
         :param use_vpn: 是否使用 VPN 模式
         :param vpn_cookies: VPN cookies 字典（可选，无则自动获取）
+        :param user_agent: 浏览器 User-Agent（可选，默认用模块内置值）
         """
         self.username = username
         self.passkey = passkey
@@ -119,6 +122,8 @@ class NuistLogin:
         self.log_level = log_level
         self.use_vpn = use_vpn
         self.vpn_cookies = vpn_cookies or {}
+        self.user_agent = user_agent
+        self._cookie_format = "legacy"
         self.session: requests.Session | None = None
 
     # ==================== 日志 ====================
@@ -202,7 +207,7 @@ class NuistLogin:
     def _new_session(self) -> requests.Session:
         session = requests.Session()
         session.headers.update({
-            "User-Agent": USER_AGENT,
+            "User-Agent": self.user_agent or USER_AGENT,
             "Accept-Language": "zh-CN,en;q=0.9,en-US;q=0.8",
         })
         return session
@@ -507,14 +512,25 @@ class NuistLogin:
 
     # ==================== 对外接口 ====================
 
-    def login(self) -> dict:
+    def _export_cookies(self, session: requests.Session) -> dict | list[dict]:
+        """按调用方要求导出 Cookie，同时保留旧版返回格式"""
+        if self._cookie_format == "scoped":
+            return [_cookie_record(cookie) for cookie in session.cookies]
+        return session.cookies.get_dict()
+
+    def login(self, cookie_format: str = "legacy") -> dict | list[dict]:
         """
         执行登录流程
 
-        :return: 登录成功后的 cookies 字典
+        :param cookie_format: legacy 返回 {name: value}；scoped 返回完整 Cookie 列表
+        :return: 登录成功后的 cookies
         :raises CredentialError: bundle 不可用或 Passkey 被拒绝
         :raises LoginError: 其他登录错误
         """
+        if cookie_format not in ("legacy", "scoped"):
+            raise ValueError(f"不支持的 cookie_format: {cookie_format}")
+        self._cookie_format = cookie_format
+
         bundle = self._load_bundle()
         private_key = self._load_private_key(bundle)
         user_id, start_id = self._resolve_ids(bundle)
@@ -532,10 +548,27 @@ class NuistLogin:
         self._log(LogLevel.INFO, "登录成功")
 
         self.session = session
-        return session.cookies.get_dict()
+        return self._export_cookies(session)
 
 
 # ==================== 内部工具 ====================
+
+def _cookie_record(cookie: Cookie) -> dict:
+    """
+    把 cookiejar 的 Cookie 转成 Playwright 风格的记录，保留 domain/path
+    等作用域信息（legacy 的 {name: value} 会丢掉这些，导致跨域 Cookie 混用）
+    """
+    return {
+        "name": cookie.name,
+        "value": cookie.value,
+        "domain": cookie.domain or "",
+        "path": cookie.path or "/",
+        "expires": cookie.expires,
+        "httpOnly": cookie.has_nonstandard_attr("HttpOnly"),
+        "secure": bool(cookie.secure),
+        "sameSite": cookie.get_nonstandard_attr("SameSite", None),
+    }
+
 
 def _reject_vpn_sso_page(url: str):
     """落到 VPN 的 SSO 登录页说明 VPN 会话失效，而不是登录成功"""
