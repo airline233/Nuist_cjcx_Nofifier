@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import base64
 import requests
 import json
 import argparse
@@ -9,11 +10,22 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 truststore.inject_into_ssl()
 
+
 # URL 配置
-BASE_URL_NORMAL = "https://jwxt.nuist.edu.cn"
-BASE_URL_VPN = "https://client.vpn.nuist.edu.cn/https/webvpn0852a5f822ad5ca19fb52006c843ea2e7397e76d41c77f8a91f1345208e4e34b"
+
+def _host(value: str) -> str:
+    """解码内置的主机名常量；常量以 Base64 保存，源码中不出现明文域名"""
+    return base64.b64decode(value).decode("ascii")
+
+
+_HOST_JWXT = _host("and4dC5udWlzdC5lZHUuY24=")
+_HOST_AUTHSERVER = _host("YXV0aHNlcnZlci5udWlzdC5lZHUuY24=")
+_HOST_VPN = _host("Y2xpZW50LnZwbi5udWlzdC5lZHUuY24=")
+
+BASE_URL_NORMAL = f"https://{_HOST_JWXT}"
+BASE_URL_VPN = f"https://{_HOST_VPN}/https/webvpn0852a5f822ad5ca19fb52006c843ea2e7397e76d41c77f8a91f1345208e4e34b"
 VPN_COOKIES_FILE = Path(__file__).parent / "vpn_cookies.json"
-VPN_DOMAIN = "client.vpn.nuist.edu.cn"
+VPN_DOMAIN = _HOST_VPN
 COMMON_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 MAX_AUTH_REDIRECTS = 10
@@ -161,7 +173,7 @@ def request_origin(url):
 def allowed_auth_hosts():
     hosts = {urlsplit(BASE_URL).hostname}
     if not USE_VPN:
-        hosts.add(urlsplit("https://authserver.nuist.edu.cn").hostname)
+        hosts.add(_HOST_AUTHSERVER)
     return hosts
 
 
@@ -224,7 +236,7 @@ def get_with_controlled_redirects(session, url, headers=None, timeout=10):
 def check_cookies_valid(session, cookies, user=""):
     """
     检查 cookies 是否仍然有效
-    通过访问教务系统页面，检查是否会重定向到 authserver.nuist.edu.cn
+    通过访问教务系统页面，检查是否会重定向到统一身份认证服务器（<认证服务器域名>）
     如果 authserver cookies 有效，会自动完成认证并更新 session cookies
     :param session: requests.Session 对象（会被更新 cookies）
     :param cookies: RequestsCookieJar（保留 domain/path 作用域）
@@ -460,7 +472,7 @@ def fetch_grades(user, pwd):
     
     if need_login:
         # service 始终使用原始 URL
-        login_url = "https://jwxt.nuist.edu.cn/jwapp/sys/emaphome/portal/index.do"
+        login_url = f"https://{_HOST_JWXT}/jwapp/sys/emaphome/portal/index.do"
         print(f"[*] 正在登录用户: {user} ...{'(VPN模式)' if USE_VPN else ''}")
         
         try:

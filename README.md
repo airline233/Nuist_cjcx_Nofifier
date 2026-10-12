@@ -155,7 +155,7 @@ from NuistLogin import NuistLogin, LogLevel
 bot = NuistLogin(
     username="202512345678",
     password="passkey.json",
-    service="https://jwxt.nuist.edu.cn/jwapp/sys/emaphome/portal/index.do",
+    service="https://<教务系统域名>/jwapp/sys/emaphome/portal/index.do",
     headless=True,           # 无头模式
     log_level=LogLevel.INFO, # 日志级别
     use_vpn=False            # 是否使用 VPN
@@ -256,7 +256,7 @@ A: 有两种方式：
 A: 请检查：
 1. `vpn_cookies.json` 文件是否存在且格式正确
 2. VPN Cookies 是否已过期（需要重新获取）
-3. 网络是否能正常访问 `client.vpn.nuist.edu.cn`
+3. 网络是否能正常访问 WebVPN 网关（`<WebVPN 域名>`）
 
 ### Q: 如何清除缓存重新开始？
 A: 删除项目目录下的 `.pkl` 和 `.json` 缓存文件即可：

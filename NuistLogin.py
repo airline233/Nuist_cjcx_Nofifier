@@ -18,7 +18,8 @@ Cookie（如 authserver 与 jwxt 各自的 JSESSIONID）只剩最后一条；需
     save_cookie_jar(jar, "cookies.txt")      # 落盘 / load_cookie_jar 读回
 
 bundle 由 browser_passkey.js 导出，可以传文件路径、JSON 文本，或已解析的
-dict，需包含 rpId / credentialId / 私钥，以及 userId 和 anonbiometricsd。
+dict，需包含 credentialId / 私钥，以及 userId 和 anonbiometricsd；
+rpId 可留空，缺省回落到内置的认证服务器域名。
 旧版 Playwright 实现保留在 legacy/playwright/NuistLogin.py，仅供参考。
 
 本模块自成一体，只依赖 requests 和 cryptography。
@@ -75,11 +76,20 @@ class _VpnSessionExpired(LoginError):
 
 # ==================== URL 配置 ====================
 
-AUTHSERVER_NORMAL = "https://authserver.nuist.edu.cn"
-AUTHSERVER_VPN = "https://client.vpn.nuist.edu.cn/https/webvpnf971ba19a2d1e2ef80f6438b88af30111008953ef2e157f5c5904ebc57eef098"
-VPN_DOMAIN = "client.vpn.nuist.edu.cn"
+def _host(value: str) -> str:
+    """解码内置的主机名常量；常量以 Base64 保存，源码中不出现明文域名"""
+    return base64.b64decode(value).decode("ascii")
+
+
+_HOST_AUTHSERVER = _host("YXV0aHNlcnZlci5udWlzdC5lZHUuY24=")
+_HOST_JWXT = _host("and4dC5udWlzdC5lZHUuY24=")
+_HOST_VPN = _host("Y2xpZW50LnZwbi5udWlzdC5lZHUuY24=")
+
+AUTHSERVER_NORMAL = f"https://{_HOST_AUTHSERVER}"
+AUTHSERVER_VPN = f"https://{_HOST_VPN}/https/webvpnf971ba19a2d1e2ef80f6438b88af30111008953ef2e157f5c5904ebc57eef098"
+VPN_DOMAIN = _HOST_VPN
 VPN_SSO_LOGIN_PATH = "/enlink/sso/login"
-VPN_CAS_CALLBACK = "https://client.vpn.nuist.edu.cn/enlink/api/client/callback/cas"
+VPN_CAS_CALLBACK = f"https://{_HOST_VPN}/enlink/api/client/callback/cas"
 
 LOGIN_PATH = "/authserver/login"
 START_ASSERTION_PATH = "/authserver/startAssertion"
@@ -169,11 +179,12 @@ class NuistLogin:
 
         if not isinstance(data, dict):
             raise CredentialError("bundle 必须是 JSON 对象")
-        for name in ("rpId", "credentialId"):
-            if not data.get(name):
-                raise CredentialError(f"bundle 缺少字段: {name}")
+        if not data.get("credentialId"):
+            raise CredentialError("bundle 缺少字段: credentialId")
         if not data.get("privateKeyPkcs8Pem") and not data.get("privateKeyJwk"):
             raise CredentialError("bundle 缺少 privateKeyPkcs8Pem/privateKeyJwk")
+        if not data.get("rpId"):
+            data["rpId"] = _HOST_AUTHSERVER
         return data
 
     @staticmethod
@@ -648,7 +659,7 @@ if __name__ == "__main__":
                 print(f"[!] VPN cookies 文件不存在: {vpn_cookies_file}")
 
     try:
-        service = "https://jwxt.nuist.edu.cn/jwapp/sys/emaphome/portal/index.do"
+        service = f"https://{_HOST_JWXT}/jwapp/sys/emaphome/portal/index.do"
 
         bot = NuistLogin(
             username=user,
